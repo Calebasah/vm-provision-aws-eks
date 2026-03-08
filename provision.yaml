@@ -1,0 +1,118 @@
+---
+- name: Provision Ubuntu 22.04 VM for AWS EC2 / EKS Access (Jumpbox)
+  hosts: localhost
+  connection: local
+  become: yes
+
+  vars:
+    install_kubectl: true
+    install_k9s: true
+    kube_dir: "{{ ansible_env.HOME }}/.kube"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      apt:
+        name:
+          - curl
+          - unzip
+          - wget
+          - python3-pip
+          - openssh-client
+        state: present
+
+    # AWS CLI v2
+    - name: Install AWS CLI v2 if missing
+      shell: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        ./aws/install --update
+        rm -rf awscliv2.zip aws
+      args:
+        creates: /usr/local/bin/aws
+
+    # kubectl
+    - name: Install latest kubectl
+      shell: |
+        K8S_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+        curl -LO "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubectl"
+        install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+        rm kubectl
+      args:
+        creates: /usr/local/bin/kubectl
+      when: install_kubectl | bool
+
+    # k9s
+    - name: Get latest k9s release info
+      uri:
+        url: https://api.github.com/repos/derailed/k9s/releases/latest
+        return_content: yes
+      register: k9s_latest
+      when: install_k9s | bool
+
+    - name: Set k9s version
+      set_fact:
+        k9s_version: "{{ k9s_latest.json.tag_name }}"
+      when: install_k9s | bool
+
+    - name: Download k9s .deb
+      get_url:
+        url: "https://github.com/derailed/k9s/releases/download/{{ k9s_version }}/k9s_Linux_amd64.deb"
+        dest: "/tmp/k9s_{{ k9s_version }}.deb"
+        mode: '0644'
+      when: install_k9s | bool
+
+    - name: Install k9s
+      apt:
+        deb: "/tmp/k9s_{{ k9s_version }}.deb"
+      when: install_k9s | bool
+
+    - name: Clean up k9s installer
+      file:
+        path: "/tmp/k9s_{{ k9s_version }}.deb"
+        state: absent
+      when: install_k9s | bool
+
+    # ── Secure kubeconfig setup ────────────────────────────────────────────────
+    - name: Create ~/.kube directory with correct ownership
+      file:
+        path: "{{ kube_dir }}"
+        state: directory
+        mode: '0700'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Fix ownership and permissions on ~/.kube recursively
+      file:
+        path: "{{ kube_dir }}"
+        state: directory
+        recurse: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: 'u=rwX,go='  # Owner rwx, everyone else nothing
+
+    - name: Ensure ~/.kube/config is private if it exists
+      file:
+        path: "{{ kube_dir }}/config"
+        mode: '0600'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      ignore_errors: true  # OK if file doesn't exist yet
+
+    # Optional: Add more tools here later (helm, eksctl, etc.)
+
+    - name: Verify key tools
+      command: "{{ item }} --version"
+      loop: "{{ ['aws'] + (['kubectl'] if install_kubectl | bool else []) + (['k9s'] if install_k9s | bool else []) }}"
+      register: versions
+      changed_when: false
+      failed_when: false
+      when: install_kubectl and install_k9s
+
+    - name: Display versions
+      debug:
+        msg: "{{ versions.results | map(attribute='stdout_lines') | list }}"
